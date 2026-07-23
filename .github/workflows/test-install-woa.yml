@@ -1,0 +1,194 @@
+name: test-install-woa
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag de la release contenant l'installeur (.exe)"
+        required: false
+        default: installer
+
+jobs:
+  install-test:
+    name: install (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Cible réelle du test : Windows 11 ARM64 (gratuit sur repo public)
+          - runner: windows-11-arm
+            label: arm64
+          # Témoin x64 : permet de distinguer « cassé sur ARM » de « cassé partout »
+          - runner: windows-latest
+            label: x64-temoin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      INSTALLER_URL: ${{ secrets.INSTALLER_URL }}
+
+    steps:
+      - name: Infos environnement
+        shell: pwsh
+        run: |
+          "OS      : $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          "Build   : $([Environment]::OSVersion.Version)"
+          "Arch OS : $env:PROCESSOR_ARCHITECTURE"
+
+      - name: Télécharger l'installeur
+        shell: pwsh
+        run: |
+          if ($env:INSTALLER_URL) {
+            "Source : secret INSTALLER_URL"
+            Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile installer.exe
+          } else {
+            "Source : release GitHub '${{ inputs.release_tag || 'installer' }}'"
+            gh release download '${{ inputs.release_tag || 'installer' }}' --repo '${{ github.repository }}' --pattern '*.exe' --output installer.exe
+          }
+          "Taille : {0:N0} octets" -f (Get-Item installer.exe).Length
+
+      - name: Installation silencieuse (/S)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "$PWD\installer.exe" -ArgumentList '/S' -Wait -PassThru
+          "Code de sortie installeur : $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: Vérifier l'installation (registre + fichiers)
+        shell: pwsh
+        run: |
+          $roots = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+          )
+          $app = $null
+          foreach ($try in 1..24) {
+            $app = Get-ChildItem $roots -ErrorAction SilentlyContinue |
+              ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+              Where-Object { $_.DisplayName -match 'Happyneuron' } |
+              Select-Object -First 1
+            if ($app) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $app) { Write-Error 'Entrée de désinstallation introuvable dans le registre'; exit 1 }
+          $app | Format-List DisplayName, DisplayVersion, InstallLocation, UninstallString
+
+          $uninstall = $app.UninstallString.Trim('"')
+          $dir = $app.InstallLocation
+          if (-not $dir) { $dir = Split-Path $uninstall }
+          if (-not (Test-Path $dir)) { Write-Error "Dossier d'installation introuvable : $dir"; exit 1 }
+          Get-ChildItem $dir | Select-Object Name, Length | Format-Table -AutoSize
+
+          "INSTALL_DIR=$dir"         | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "UNINSTALL_EXE=$uninstall" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Architecture du binaire installé
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem $env:INSTALL_DIR -Filter '*.exe' |
+            Where-Object { $_.Name -notmatch '^Uninstall' } |
+            Select-Object -First 1
+          if (-not $exe) { Write-Error 'Exécutable principal introuvable'; exit 1 }
+          "EXE_PATH=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+          $fs = [System.IO.File]::OpenRead($exe.FullName)
+          $br = New-Object System.IO.BinaryReader($fs)
+          $null = $fs.Seek(0x3C, 'Begin')
+          $peOffset = $br.ReadInt32()
+          $null = $fs.Seek($peOffset + 4, 'Begin')
+          $machine = $br.ReadUInt16()
+          $fs.Close()
+          $archName = switch ($machine) {
+            0x014c { 'x86' }
+            0x8664 { 'x64' }
+            0xAA64 { 'ARM64' }
+            default { '0x{0:X4}' -f $machine }
+          }
+          "Binaire : $($exe.Name) -> $archName (OS hôte : $env:PROCESSOR_ARCHITECTURE)"
+          if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -and $archName -ne 'ARM64') {
+            Write-Warning "Le binaire tournera sous émulation ($archName sur ARM64)."
+          }
+
+      - name: Lancement et vérification du process
+        shell: pwsh
+        run: |
+          Start-Process -FilePath $env:EXE_PATH
+          Start-Sleep -Seconds 30
+
+          $procs = Get-Process | Where-Object { $_.Name -match 'Happyneuron' }
+          if (-not $procs) { Write-Error "Aucun process 'Happyneuron' vivant 30 s après lancement"; exit 1 }
+          $procs | Select-Object Id, Name, WorkingSet64 | Format-Table -AutoSize
+
+          # Le plugin expose un serveur local : on relève les ports en écoute de ses process
+          $procIds = $procs.Id
+          $listen = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $procIds -contains $_.OwningProcess }
+          if ($listen) {
+            $listen | Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table -AutoSize
+            foreach ($l in $listen | Select-Object -Unique -First 5) {
+              try {
+                $r = Invoke-WebRequest -Uri "https://127.0.0.1:$($l.LocalPort)/" -SkipCertificateCheck -TimeoutSec 5 -UseBasicParsing
+                "Port $($l.LocalPort) : HTTP $($r.StatusCode)"
+              } catch {
+                "Port $($l.LocalPort) : $($_.Exception.Message)"
+              }
+            }
+          } else {
+            Write-Warning 'Aucun port en écoute détecté pour les process du plugin.'
+          }
+
+      - name: Certificat racine installé ?
+        shell: pwsh
+        run: |
+          $found = $false
+          foreach ($store in 'Cert:\CurrentUser\Root', 'Cert:\LocalMachine\Root') {
+            Get-ChildItem $store -ErrorAction SilentlyContinue |
+              Where-Object { $_.Subject -match 'Happyneuron|Humans Matter' } |
+              ForEach-Object { $found = $true; "$store : $($_.Subject)" }
+          }
+          if (-not $found) { Write-Warning 'Certificat racine Happyneuron absent des magasins Root.' }
+
+      - name: Collecter les logs applicatifs
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force applogs | Out-Null
+          $candidates = @(
+            "$env:APPDATA\Plugin Happyneuron",
+            "$env:APPDATA\plugin-happyneuron",
+            "$env:LOCALAPPDATA\com.happyneuron.plug-in-updater"
+          )
+          foreach ($d in $candidates) {
+            if (Test-Path $d) { Copy-Item $d -Destination applogs -Recurse -Force }
+          }
+          Get-ChildItem applogs -Recurse | Select-Object FullName | Format-Table -AutoSize
+
+      - name: Uploader les logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: applogs-${{ matrix.label }}
+          path: applogs/
+          if-no-files-found: ignore
+
+      - name: Désinstallation silencieuse
+        shell: pwsh
+        run: |
+          Get-Process | Where-Object { $_.Name -match 'Happyneuron' } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+          $p = Start-Process -FilePath $env:UNINSTALL_EXE -ArgumentList '/S' -Wait -PassThru
+          "Code de sortie désinstalleur : $($p.ExitCode)"
+
+          # Le désinstalleur NSIS se recopie dans %TEMP% et rend la main avant la fin réelle
+          foreach ($try in 1..12) {
+            if (-not (Test-Path $env:INSTALL_DIR)) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (Test-Path $env:INSTALL_DIR) {
+            Write-Warning "Dossier encore présent après désinstallation : $env:INSTALL_DIR"
+          } else {
+            'Désinstallation OK, dossier supprimé.'
+          }
