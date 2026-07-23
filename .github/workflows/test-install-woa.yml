@@ -126,12 +126,39 @@ jobs:
             Where-Object { $procIds -contains $_.OwningProcess }
           if ($listen) {
             $listen | Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table -AutoSize
+            # Probe multi-protocole : handshake WebSocket (wss puis ws), puis GET HTTP(S)
             foreach ($l in $listen | Select-Object -Unique -First 5) {
-              try {
-                $r = Invoke-WebRequest -Uri "https://127.0.0.1:$($l.LocalPort)/" -SkipCertificateCheck -TimeoutSec 5 -UseBasicParsing
-                "Port $($l.LocalPort) : HTTP $($r.StatusCode)"
-              } catch {
-                "Port $($l.LocalPort) : $($_.Exception.Message)"
+              $port = $l.LocalPort
+              $connected = $false
+              foreach ($scheme in 'wss', 'ws') {
+                $ws = [System.Net.WebSockets.ClientWebSocket]::new()
+                if ($scheme -eq 'wss') {
+                  $ws.Options.RemoteCertificateValidationCallback = { $true }
+                }
+                try {
+                  $cts = [System.Threading.CancellationTokenSource]::new(5000)
+                  $ws.ConnectAsync([Uri]"${scheme}://127.0.0.1:$port/", $cts.Token).GetAwaiter().GetResult()
+                  "Port $port : handshake $scheme OK (state : $($ws.State))"
+                  $connected = $true
+                } catch {
+                  $msg = $_.Exception.InnerException.Message
+                  if (-not $msg) { $msg = $_.Exception.Message }
+                  "Port $port : $scheme KO — $msg"
+                } finally {
+                  $ws.Dispose()
+                }
+                if ($connected) { break }
+              }
+              if (-not $connected) {
+                foreach ($scheme in 'https', 'http') {
+                  try {
+                    $r = Invoke-WebRequest -Uri "${scheme}://127.0.0.1:$port/" -SkipCertificateCheck -TimeoutSec 5 -UseBasicParsing
+                    "Port $port : GET $scheme -> HTTP $($r.StatusCode)"
+                    break
+                  } catch {
+                    "Port $port : GET $scheme KO — $($_.Exception.Message)"
+                  }
+                }
               }
             }
           } else {
