@@ -126,18 +126,21 @@ jobs:
             Where-Object { $procIds -contains $_.OwningProcess }
           if ($listen) {
             $listen | Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table -AutoSize
-            # Probe multi-protocole : handshake WebSocket (wss puis ws), puis GET HTTP(S)
+            # Probe multi-protocole : handshake WebSocket (wss puis ws), puis GET HTTP(S).
+            # Le callback de validation TLS doit être un delegate compilé : un scriptblock
+            # PowerShell s'exécute sur un thread sans runspace et casse le handshake.
+            Add-Type -TypeDefinition 'using System.Net.Security; public static class TrustAllCerts { public static readonly RemoteCertificateValidationCallback Callback = (s, c, ch, e) => true; }'
             foreach ($l in $listen | Select-Object -Unique -First 5) {
               $port = $l.LocalPort
               $connected = $false
               foreach ($scheme in 'wss', 'ws') {
                 $ws = [System.Net.WebSockets.ClientWebSocket]::new()
                 if ($scheme -eq 'wss') {
-                  $ws.Options.RemoteCertificateValidationCallback = { $true }
+                  $ws.Options.RemoteCertificateValidationCallback = [TrustAllCerts]::Callback
                 }
                 try {
                   $cts = [System.Threading.CancellationTokenSource]::new(5000)
-                  $ws.ConnectAsync([Uri]"${scheme}://127.0.0.1:$port/", $cts.Token).GetAwaiter().GetResult()
+                  $null = $ws.ConnectAsync([Uri]"${scheme}://127.0.0.1:$port/", $cts.Token).GetAwaiter().GetResult()
                   "Port $port : handshake $scheme OK (state : $($ws.State))"
                   $connected = $true
                 } catch {
